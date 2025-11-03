@@ -16,17 +16,6 @@
 #define CS_PIN        2
 #define BUTTON_PIN    3
 
-// ----------------- WiFi & MQTT -----------------
-const char* WIFI_SSID = "WIFI_Demo";
-const char* WIFI_PASS = "18638227200";
-const char* MQTT_SERVER = "192.168.124.13";
-const int   MQTT_PORT   = 1883;
-const char* MQTT_USER   = "mqttuser";
-const char* MQTT_PASS   = "123456";
-const char* MQTT_TOPIC_FANS    = "dfrobot/fans";
-const char* MQTT_TOPIC_WEATHER = "dfrobot/weather";
-const char* MQTT_TOPIC_CONFIG  = "devices/config";
-
 // ----------------- 显示对象 -----------------
 MD_Parola display = MD_Parola(HARDWARE_TYPE, DATA_PIN, CLK_PIN, CS_PIN, MAX_DEVICES);
 MD_MAX72XX mx = MD_MAX72XX(HARDWARE_TYPE, DATA_PIN, CLK_PIN, CS_PIN, MAX_DEVICES);
@@ -35,9 +24,7 @@ MD_MAX72XX mx = MD_MAX72XX(HARDWARE_TYPE, DATA_PIN, CLK_PIN, CS_PIN, MAX_DEVICES
 volatile bool buttonIRQ = false;
 unsigned long lastDebounceMillis = 0;
 unsigned long lastActivityMillis = 0;
-const unsigned long debounceMs = 200;
-const unsigned long displayTimeoutMs = 15000;
-uint8_t displayStage = 0; // 0=息屏,1=时间粗,2=笑脸,3=时间细,4=多区域
+uint8_t displayStage = 0; // 0=息屏,1=时间粗,2=天气,3=多区域
 
 volatile int currentFans = -1;
 volatile int lastFans = -1;
@@ -46,6 +33,25 @@ volatile int lastFans = -1;
 WiFiClient netClient;
 PubSubClient mqtt(netClient);
 Preferences prefs;
+
+// ----------------- 配置结构体 -----------------
+struct Config {
+  String wifi_ssid;
+  String wifi_pass;
+  String mqtt_server;
+  int    mqtt_port;
+  String mqtt_user;
+  String mqtt_pass;
+  unsigned long debounceMs;
+  unsigned long displayTimeoutMs;
+};
+
+Config cfg = {
+  "WIFI_Demo", "18638227200",
+  "192.168.124.13", 1883,
+  "mqttuser", "123456",
+  200, 15000
+};
 
 // ----------------- 数据结构 -----------------
 typedef struct {
@@ -68,7 +74,7 @@ bool pollButtonPressed() {
   bool current = digitalRead(BUTTON_PIN);
   unsigned long now = millis();
   if (current != lastState) lastDebounceMillis = now;
-  if ((now - lastDebounceMillis) > debounceMs) {
+  if ((now - lastDebounceMillis) > cfg.debounceMs) {
     if (lastState == HIGH && current == LOW) {
       lastState = current;
       return true;
@@ -78,7 +84,7 @@ bool pollButtonPressed() {
   return false;
 }
 
-// ----------------- 显示函数（保留原有） -----------------
+// ----------------- 显示函数 -----------------
 void drawImageEx(const uint8_t img[8], bool mirrorX = true, bool mirrorY = false)
 {
   mx.clear();
@@ -93,21 +99,15 @@ void drawImageEx(const uint8_t img[8], bool mirrorX = true, bool mirrorY = false
   }
 }
 
-void drawImage(const uint8_t img[8])
-{
-  drawImageEx(img, true, True);
-}
+void drawImage(const uint8_t img[8]) { drawImageEx(img, true, false); }
 
 // ----------------- 通用二进制显示函数 -----------------
-// d1=小时十位, d2=小时个位, d3=分钟十位, d4=分钟个位
-// thickness=1 表示 1x1, thickness=2 表示 2x2
-// offsetX, offsetY 表示 d1 的最高位(即 bit3)的左上角坐标
 void displayBinaryDigits(uint8_t d1, uint8_t d2, uint8_t d3, uint8_t d4,
                          uint8_t thickness, uint8_t offsetX, uint8_t offsetY)
 {
   uint8_t digits[4] = { d1, d2, d3, d4 };
-  for (uint8_t c = 0; c < 4; c++) {          // 4 个数字
-    for (uint8_t r = 0; r < 4; r++) {        // 每个数字的 4 位二进制 (bit3在上，bit0在下)
+  for (uint8_t c = 0; c < 4; c++) {
+    for (uint8_t r = 0; r < 4; r++) {
       bool on = (digits[c] >> r) & 0x01;
       if (!on) continue;
       uint8_t baseX = offsetX + c * thickness;
@@ -145,29 +145,74 @@ show_data_s convertTimeData(struct tm* timeinfo, int temp, int hum, int fans) {
   return d;
 }
 
+// ----------------- 配置存取 -----------------
+void loadConfig() {
+  String json = prefs.getString("config", "");
+  if (json.length() == 0) {
+    Serial.println("No config in prefs, using defaults");
+    return;
+  }
+  Serial.printf("Config JSON from prefs: %s\n", json.c_str());
+  StaticJsonDocument<512> doc;
+  if (deserializeJson(doc, json) != DeserializationError::Ok) {
+    Serial.println("Config JSON parse error, using defaults");
+    return;
+  }
+  if (doc.containsKey("wifi_ssid")) cfg.wifi_ssid = doc["wifi_ssid"].as<String>();
+  if (doc.containsKey("wifi_pass")) cfg.wifi_pass = doc["wifi_pass"].as<String>();
+  if (doc.containsKey("mqtt_server")) cfg.mqtt_server = doc["mqtt_server"].as<String>();
+  if (doc.containsKey("mqtt_port"))   cfg.mqtt_port   = doc["mqtt_port"].as<int>();
+  if (doc.containsKey("mqtt_user"))   cfg.mqtt_user   = doc["mqtt_user"].as<String>();
+  if (doc.containsKey("mqtt_pass"))   cfg.mqtt_pass   = doc["mqtt_pass"].as<String>();
+  if (doc.containsKey("debounceMs"))  cfg.debounceMs  = doc["debounceMs"].as<unsigned long>();
+  if (doc.containsKey("displayTimeoutMs")) cfg.displayTimeoutMs = doc["displayTimeoutMs"].as<unsigned long>();
+}
+
+void saveConfig() {
+  StaticJsonDocument<512> doc;
+  doc["wifi_ssid"] = cfg.wifi_ssid;
+  doc["wifi_pass"] = cfg.wifi_pass;
+  doc["mqtt_server"] = cfg.mqtt_server;
+  doc["mqtt_port"] = cfg.mqtt_port;
+  doc["mqtt_user"] = cfg.mqtt_user;
+  doc["mqtt_pass"] = cfg.mqtt_pass;
+  doc["debounceMs"] = cfg.debounceMs;
+  doc["displayTimeoutMs"] = cfg.displayTimeoutMs;
+  String json;
+  serializeJson(doc, json);
+  prefs.putString("config", json);
+  Serial.printf("Config saved: %s\n", json.c_str());
+}
+
 // ----------------- MQTT回调 -----------------
 void mqttCallback(char* topic, byte* payload, unsigned int length) {
   String t = String(topic);
 
-  if (t == MQTT_TOPIC_CONFIG) {
+  if (t == "devices/config") {
     String msg;
     msg.reserve(length);
-    for (unsigned int i = 0; i < length; i++) msg += (char)payload[i];
-    StaticJsonDocument<256> doc;
-    if (deserializeJson(doc, msg) == DeserializationError::Ok) {
-      if (doc.containsKey("ssid") && doc.containsKey("pass")) {
-        String ssid = doc["ssid"].as<String>();
-        String pass = doc["pass"].as<String>();
-        prefs.putString("wifi_ssid", ssid);
-        prefs.putString("wifi_pass", pass);
-        WiFi.disconnect(true);
-        WiFi.mode(WIFI_MODE_STA);
-        WiFi.begin(ssid.c_str(), pass.c_str());
-      }
+    for (unsigned int i = 0; i < length; i++)
+      msg += (char)payload[i];
+      StaticJsonDocument<512> doc;
+      if (deserializeJson(doc, msg) == DeserializationError::Ok) {
+      if (doc.containsKey("wifi_ssid")) cfg.wifi_ssid = doc["wifi_ssid"].as<String>();
+      if (doc.containsKey("wifi_pass")) cfg.wifi_pass = doc["wifi_pass"].as<String>();
+      if (doc.containsKey("mqtt_server")) cfg.mqtt_server = doc["mqtt_server"].as<String>();
+      if (doc.containsKey("mqtt_port"))   cfg.mqtt_port   = doc["mqtt_port"].as<int>();
+      if (doc.containsKey("mqtt_user"))   cfg.mqtt_user   = doc["mqtt_user"].as<String>();
+      if (doc.containsKey("mqtt_pass"))   cfg.mqtt_pass   = doc["mqtt_pass"].as<String>();
+      if (doc.containsKey("debounceMs"))  cfg.debounceMs  = doc["debounceMs"].as<unsigned long>();
+      if (doc.containsKey("displayTimeoutMs")) cfg.displayTimeoutMs = doc["displayTimeoutMs"].as<unsigned long>();
+
+      saveConfig();
+      Serial.println("Config updated from MQTT");
+    } else {
+      Serial.println("Config JSON parse error");
     }
   }
 
-  if (t == MQTT_TOPIC_FANS) {
+  // 粉丝数更新
+  else if (t == "dfrobot/fans") {
     StaticJsonDocument<128> doc;
     if (deserializeJson(doc, payload, length) == DeserializationError::Ok) {
       if (doc.containsKey("fans")) {
@@ -175,12 +220,15 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
         currentFans = doc["fans"].as<int>();
         Serial.printf("粉丝数更新: %d\n", currentFans);
       }
+    } else {
+      Serial.println("Fans JSON parse error");
     }
   }
 
-  if (t == MQTT_TOPIC_WEATHER) {
+  // 天气更新
+  else if (t == "dfrobot/weather") {
     StaticJsonDocument<512> doc;
-    if (deserializeJson(doc, payload, length) != DeserializationError::Ok) {
+    if (deserializeJson(doc, payload, length) == DeserializationError::Ok) {
       if (doc.containsKey("now")) {
         JsonObject now = doc["now"];
         const char* temp     = now["temp"];
@@ -188,6 +236,7 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
         const char* windDir  = now["windDir"];
         const char* humidity = now["humidity"];
         const char* obsTime  = now["obsTime"];
+
         Serial.printf("观测时间: %s\n", obsTime);
         Serial.printf("温度: %s°C, 天气: %s\n", temp, text);
         Serial.printf("风向: %s, 湿度: %s%%\n", windDir, humidity);
@@ -197,30 +246,6 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
     }
   }
 }
-
-// ----------------- MQTT任务 -----------------
-void mqttTask(void* pv) {
-  mqtt.setServer(MQTT_SERVER, MQTT_PORT);
-  mqtt.setCallback(mqttCallback);
-  const TickType_t tick50 = pdMS_TO_TICKS(50);
-  while (true) {
-    if (WiFi.status() == WL_CONNECTED) {
-      if (!mqtt.connected()) {
-        String clientId = "ESP32Client-" + String((uint32_t)ESP.getEfuseMac(), HEX);
-        if (mqtt.connect(clientId.c_str(), MQTT_USER, MQTT_PASS)) {
-          mqtt.subscribe(MQTT_TOPIC_FANS);
-          mqtt.subscribe(MQTT_TOPIC_CONFIG);
-          mqtt.subscribe(MQTT_TOPIC_WEATHER);
-          Serial.println("MQTT connected");
-        }
-      }
-      mqtt.loop();
-    }
-    vTaskDelay(tick50);
-  }
-}
-
-// ----------------- WiFi任务 -----------------
 void connectWiFi(const String& ssid, const String& pass) {
   if (ssid.length() == 0) return;
   WiFi.disconnect(true);
@@ -242,15 +267,11 @@ void connectWiFi(const String& ssid, const String& pass) {
 void wifiTask(void* pv) {
   const TickType_t retry = pdMS_TO_TICKS(5000);
   bool ntpDone = false;
-  String ssid = prefs.getString("wifi_ssid", String(WIFI_SSID));
-  String pass = prefs.getString("wifi_pass", String(WIFI_PASS));
-  Serial.println(ssid);
-  Serial.println(pass);
-  connectWiFi(ssid, pass);
+  connectWiFi(cfg.wifi_ssid, cfg.wifi_pass);
   while (true) {
     if (WiFi.status() != WL_CONNECTED) {
       Serial.println("→ Wi‑Fi lost, retry...");
-      connectWiFi(ssid, pass);
+      connectWiFi(cfg.wifi_ssid, cfg.wifi_pass);
       vTaskDelay(retry);
     } else {
       if (!ntpDone) {
@@ -263,10 +284,33 @@ void wifiTask(void* pv) {
   }
 }
 
-// ----------------- setup -----------------
+void mqttTask(void* pv) {
+  mqtt.setServer(cfg.mqtt_server.c_str(), cfg.mqtt_port);
+  mqtt.setCallback(mqttCallback);
+  const TickType_t tick50 = pdMS_TO_TICKS(50);
+  while (true) {
+    if (WiFi.status() == WL_CONNECTED) {
+      if (!mqtt.connected()) {
+        String clientId = "ESP32Client-" + String((uint32_t)ESP.getEfuseMac(), HEX);
+        if (mqtt.connect(clientId.c_str(), cfg.mqtt_user.c_str(), cfg.mqtt_pass.c_str())) {
+          mqtt.subscribe("dfrobot/fans");
+          mqtt.subscribe("devices/config");
+          mqtt.subscribe("dfrobot/weather");
+          Serial.println("MQTT connected");
+        }
+      }
+      mqtt.loop();
+    }
+    vTaskDelay(tick50);
+  }
+}
+
 void setup() {
   Serial.begin(115200);
   prefs.begin("cfg", false);
+
+  // 加载配置
+  loadConfig();
 
   pinMode(BUTTON_PIN, INPUT_PULLUP);
   attachInterrupt(BUTTON_PIN, buttonISR, FALLING);
@@ -286,7 +330,6 @@ void setup() {
   lastActivityMillis = millis();
 }
 
-// ----------------- loop -----------------
 void loop() {
   bool pressed = pollButtonPressed();
   if (!pressed && buttonIRQ) {
@@ -319,6 +362,14 @@ void loop() {
       drawImage(IMG_XIAO[0]);
     } 
     else if (displayStage == 3) {
+      // 细显示：1x1，左上角 (1,1)
+      show_data_s d = convertTimeData(timeinfo, 35, 92, (currentFans>=0?currentFans:59));
+      mx.clear();
+      displayBinaryDigits(d.hour_ten, d.hour_units,
+                          d.min_ten, d.min_units,
+                          1, 1, 1);
+    }
+    else if (displayStage == 4) {
       // 多区域显示，100ms 刷新
       static unsigned long lastUpdate = 0;
       if (millis() - lastUpdate >= 100) {
@@ -348,12 +399,12 @@ void loop() {
       }
     }
   }
-  if (!displayTimeoutMs) {
-    if (displayStage != 0 && millis() - lastActivityMillis > displayTimeoutMs) {
-      displayStage = 0;
-      mx.clear();
-      Serial.println("Timeout, back to sleep");
-    }
+
+  if (displayStage != 0 && millis() - lastActivityMillis > cfg.displayTimeoutMs) {
+    displayStage = 0;
+    mx.clear();
+    Serial.println("Timeout, back to sleep");
   }
-  delay(100);
+
+  delay(30);
 }
